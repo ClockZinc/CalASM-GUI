@@ -1,0 +1,4 @@
+pandas>=1.0.0
+akshare>=1.0.0
+matplotlib>=3.0.0
+pyinstaller>=5.0.0
