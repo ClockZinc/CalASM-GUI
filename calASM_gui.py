@@ -15,8 +15,20 @@ import matplotlib.pyplot as plt
 import socket
 socket.setdefaulttimeout(15) # 设置全局网络超时时间(秒)
 
-
 DEFAUT_STOKE = """600372 中航机载
+600435 北方导航
+002519 银河电子
+600783 鲁信创投
+002151 北斗星通
+002202 金风科技
+600879 航天电子
+600118 中国卫星
+002792 通宇通讯
+002131 利欧股份"""
+
+
+
+DEFAUT_STOKE2 = """600372 中航机载
 601698 中国卫通
 600435 北方导航
 002519 银河电子
@@ -112,28 +124,72 @@ def get_market_rules(stock_code):
 
 def get_future_trading_dates(start_date_str, count):
     dates = []
+    
+    # 1. 优先尝试读取本地 trading_dates.txt
+    # 文件格式: 每行一个日期 YYYYMMDD
+    if os.path.exists("trading_dates.txt"):
+        try:
+            with open("trading_dates.txt", "r", encoding='utf-8') as f:
+                # 读取并清洗数据
+                file_dates = []
+                for line in f:
+                    d = line.strip()
+                    if d.isdigit() and len(d) == 8:
+                        file_dates.append(d)
+                
+                # 排序并筛选
+                file_dates.sort()
+                dates = [d for d in file_dates if d > start_date_str]
+                if len(dates) >= count:
+                    return dates[:count]
+        except Exception as e:
+            print(f"读取 trading_dates.txt 失败: {e}")
+
+    # 2. 尝试从 AKShare 获取 (修正了日期格式转换)
     try:
         df = ak.tool_trade_date_hist_sina()
-        all_dates = df['trade_date'].astype(str).tolist()
-        dates = [d for d in all_dates if d > start_date_str]
-        dates = dates[:count]
+        # 强制转换为 YYYYMMDD 格式字符串
+        df['trade_date'] = pd.to_datetime(df['trade_date']).dt.strftime('%Y%m%d')
+        all_dates = df['trade_date'].tolist()
+        
+        ak_dates = [d for d in all_dates if d > start_date_str]
+        if len(ak_dates) >= count:
+            # 如果AKShare数据足够，直接使用
+            # 只有当 AKShare 返回了有效未来日期时才覆盖
+            dates = ak_dates[:count]
     except:
         pass
     
-    try:
-        current_date = datetime.strptime(start_date_str, "%Y%m%d")
-    except:
-        return [f"T+{i+1}" for i in range(count)]
+    # 如果已经获取到足够的日期，直接返回
+    if len(dates) >= count:
+        return dates[:count]
 
+    # 3. 兜底回退逻辑 (仅排除周末，不包含节假日)
+    # 如果 dates 有部分数据(比如来自本地文件但不够)，则基于最后一个日期继续推算
+    if dates:
+        try:
+            current_date = datetime.strptime(dates[-1], "%Y%m%d")
+        except:
+            current_date = datetime.strptime(start_date_str, "%Y%m%d")
+    else:
+        try:
+            current_date = datetime.strptime(start_date_str, "%Y%m%d")
+        except:
+            return [f"T+{i+1}" for i in range(count)]
+
+    # 补齐剩余所需的日期
     while len(dates) < count:
         current_date += timedelta(days=1)
+        # 0-4 是周一到周五
         if current_date.weekday() < 5:
             d_str = current_date.strftime("%Y%m%d")
+            # 避免重复添加
             if d_str not in dates:
                 dates.append(d_str)
+                
     return dates
 
-def analyze_period_combined(df, future_dates, days, threshold, limit_ratio):
+def analyze_period_combined(df, future_dates, days, threshold, limit_ratio, strict_mode=False):
     result_data = []
     current_idx = len(df) - 1
     
@@ -143,6 +199,10 @@ def analyze_period_combined(df, future_dates, days, threshold, limit_ratio):
     t_row = df.iloc[current_idx]
     current_price = t_row['close']
     current_index = t_row['index_close']
+    
+    # 预计算：为了严格模式，我们需要快速访问历史价格
+    # df 已经包含直到 current_idx 的历史数据
+    # 对于未来预测日，价格假设为 current_price
     
     for offset in range(-2, len(future_dates) + 1):
         if offset <= 0:
@@ -155,6 +215,8 @@ def analyze_period_combined(df, future_dates, days, threshold, limit_ratio):
             p_end = target_row['close']
             i_end = target_row['index_close']
             actual_pct = target_row['pct_chg']
+            
+            # 标准基准
             base_idx = target_idx - days
             p_prev = df.iloc[target_idx - 1]['close'] if target_idx > 0 else p_end
         else:
@@ -165,18 +227,68 @@ def analyze_period_combined(df, future_dates, days, threshold, limit_ratio):
             except:
                 target_date_str = f"{date_str}(T+{offset})"
             
-            p_end = current_price
+            p_end = current_price # 假设未来价格不变
             i_end = current_index
             p_prev = current_price 
             actual_pct = 0.0
-            base_idx = current_idx + offset - days
+            
+            # 标准基准索引 (相对于df)
+            target_idx = current_idx + offset
+            base_idx = target_idx - days 
 
         if base_idx < 0: continue
 
-        base_row = df.iloc[base_idx]
+        # --- 获取基准数据 (Standard vs Strict) ---
+        if strict_mode:
+            # 严格模式：寻找 [target_idx - days, target_idx] 区间内的最低价作为基准
+            # 注意：区间可能包含“未来日”，未来日价格 = current_price
+            
+            # 1. 确定搜索范围在 df 中的有效部分
+            # search_start_idx = base_idx
+            # search_end_idx = target_idx (inclusive)
+            
+            min_price = 999999.0
+            best_base_row = None
+            
+            # 遍历寻找最低点
+            # 实际上主要是历史部分有波动，未来部分是平的(current_price)
+            # 所以只有当 current_price < historical_min 时，未来部分才会成为基准(一般不出现，除非暴跌)
+            # 我们主要搜索历史部分 [base_idx, min(target_idx, current_idx)]
+            
+            search_end_real = min(target_idx, current_idx)
+            
+            # 优化：仅在历史范围内搜索
+            if search_end_real >= base_idx:
+                # 切片搜索
+                subset = df.iloc[base_idx : search_end_real + 1]
+                if not subset.empty:
+                    min_idx_relative = subset['close'].idxmin()
+                    min_price = subset.loc[min_idx_relative, 'close']
+                    best_base_row = subset.loc[min_idx_relative]
+            
+            # 如果区间包含未来部分，且当前价格比历史最低还低（极少见），则更新
+            if target_idx > current_idx:
+                if current_price < min_price:
+                    min_price = current_price
+                    # 虚拟 row
+                    best_base_row = {'close': current_price, 'index_close': current_index, 'date': 'Future'}
+            
+            if best_base_row is None:
+                 base_row = df.iloc[base_idx] # Fallback
+            else:
+                 base_row = best_base_row
+                 
+        else:
+            # 标准模式：严格 T-30
+            # 如果 base_idx > current_idx (未来)，由于我们假设指数不变，取 current
+            if base_idx > current_idx:
+                base_row = {'close': current_price, 'index_close': current_index, 'date': 'Future(Base)'}
+            else:
+                base_row = df.iloc[base_idx]
+
         p_base = base_row['close']
         i_base = base_row['index_close']
-        base_date_str = base_row['date']
+        base_date_str = base_row.get('date', 'Unknown')
 
         try:
             d_p_end = Decimal(str(p_end)) 
@@ -216,7 +328,7 @@ def analyze_period_combined(df, future_dates, days, threshold, limit_ratio):
         row_dict = {
             "日期": target_date_str,
             "类型": type_label,
-            "基准日期": base_date_str,
+            "基准日期": base_date_str + ("(Low)" if strict_mode and base_date_str != "Future" else ""),
             "实际涨幅": f"{round_half_up(actual_pct, 2):.2f}%", 
             "区间偏离": f"{round_half_up(deviation, 2):.2f}%",
             "剩余空间": "已触发" if is_triggered else f"{round_half_up(left_space, 2):.2f}%",
@@ -537,6 +649,9 @@ class AnalysisApp:
         self.show_boards_var = tk.BooleanVar(value=True)
         tk.Checkbutton(opt_frame, text="显示连板", variable=self.show_boards_var).pack(side=tk.LEFT, padx=5)
 
+        self.strict_mode_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(opt_frame, text="严格模式(区间最低点)", variable=self.strict_mode_var).pack(side=tk.LEFT, padx=5)
+
         btn_frame = tk.Frame(top_frame)
         btn_frame.pack(fill=tk.X)
         
@@ -596,6 +711,8 @@ class AnalysisApp:
         
         # 获取显示连板状态
         show_boards = self.show_boards_var.get()
+        # 获取严格模式状态
+        strict_mode = self.strict_mode_var.get()
 
         # 设置运行状态
         self.is_running = True
@@ -604,9 +721,9 @@ class AnalysisApp:
         self.run_btn.config(state='normal', text="停止 / 刷新", bg="#e74c3c")
 
         # 启动线程
-        threading.Thread(target=self.run_process, args=(stock_list, days_count, show_boards), daemon=True).start()
+        threading.Thread(target=self.run_process, args=(stock_list, days_count, show_boards, strict_mode), daemon=True).start()
 
-    def run_process(self, stock_list, days_count=3, show_boards=True):
+    def run_process(self, stock_list, days_count=3, show_boards=True, strict_mode=False):
         summary_list_10 = []
         summary_list_30 = []
         summary_list_combined = [] # 综合最严异动列表
@@ -614,6 +731,11 @@ class AnalysisApp:
         target_date_str = datetime.now().strftime("%Y%m%d")
         self.log(f"分析日期: {target_date_str}")
         self.log(f"预测天数: {days_count} 天")
+        if strict_mode:
+            self.log(f"模式: 严格模式 (基准 = 区间最低价)")
+        else:
+            self.log(f"模式: 标准模式 (基准 = T-N日收盘价)")
+            
         self.log(f"共 {len(stock_list)} 支股票待处理...")
         self.log("-" * 40)
 
@@ -636,7 +758,7 @@ class AnalysisApp:
 
             try:
                 self.log(f"正在处理: {code} {name} ...")
-                s10, s30 = self.process_one_stock(code, name, target_date_str, days_count)
+                s10, s30 = self.process_one_stock(code, name, target_date_str, days_count, strict_mode)
                 
                 # 收集分表数据
                 if s10: summary_list_10.append(s10)
@@ -741,7 +863,7 @@ class AnalysisApp:
                  self.log(f"绘图失败: {e}")
                  traceback.print_exc()
 
-    def process_one_stock(self, stock_code, name, target_date_str, days_count=3):
+    def process_one_stock(self, stock_code, name, target_date_str, days_count=3, strict_mode=False):
         index_code, index_name, limit_ratio = get_market_rules(stock_code)
         start_date = (pd.to_datetime(target_date_str) - timedelta(days=120)).strftime("%Y%m%d")
         
@@ -811,8 +933,8 @@ class AnalysisApp:
         current_price = merged.iloc[-1]['close']
         future_dates = get_future_trading_dates(last_date_str, days_count)
 
-        df_10 = analyze_period_combined(merged, future_dates, 10, 100.0, limit_ratio)
-        df_30 = analyze_period_combined(merged, future_dates, 30, 200.0, limit_ratio)
+        df_10 = analyze_period_combined(merged, future_dates, 10, 100.0, limit_ratio, strict_mode)
+        df_30 = analyze_period_combined(merged, future_dates, 30, 200.0, limit_ratio, strict_mode)
 
         def extract_summary(res_df, type_name):
             # 将所有预测行整理到字典 map
