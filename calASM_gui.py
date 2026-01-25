@@ -13,6 +13,7 @@ import matplotlib
 matplotlib.use('Agg') # 强制使用非交互式后端，修复多线程报错
 import matplotlib.pyplot as plt
 import socket
+import random
 socket.setdefaulttimeout(15) # 设置全局网络超时时间(秒)
 
 DEFAUT_STOKE = """600372 中航机载
@@ -616,12 +617,15 @@ class AnalysisApp:
         self.root = root
         self.root.title("异动分析计算器 v1.0")
         self.root.geometry("1000x700")
-        
         # 运行状态标志
         self.is_running = False
         self.stop_requested = False
         
+        # 指数数据缓存，避免重复请求
+        self.index_cache = {}
+
         # 顶部输入区域
+        top_frame = tk.Frame(root, pady=10)
         top_frame = tk.Frame(root, pady=10)
         top_frame.pack(fill=tk.X, padx=10)
         
@@ -651,6 +655,9 @@ class AnalysisApp:
 
         self.strict_mode_var = tk.BooleanVar(value=False)
         tk.Checkbutton(opt_frame, text="严格模式(区间最低点)", variable=self.strict_mode_var).pack(side=tk.LEFT, padx=5)
+
+        self.monitoring_mode_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(opt_frame, text="监管期(3天20%)", variable=self.monitoring_mode_var).pack(side=tk.LEFT, padx=5)
 
         btn_frame = tk.Frame(top_frame)
         btn_frame.pack(fill=tk.X)
@@ -713,27 +720,36 @@ class AnalysisApp:
         show_boards = self.show_boards_var.get()
         # 获取严格模式状态
         strict_mode = self.strict_mode_var.get()
+        # 获取监管期模式状态
+        monitoring_mode = self.monitoring_mode_var.get()
 
         # 设置运行状态
         self.is_running = True
         self.stop_requested = False
+        # 清空指数缓存
+        self.index_cache = {}
         # 按钮变为红色停止按钮
         self.run_btn.config(state='normal', text="停止 / 刷新", bg="#e74c3c")
-
+        
         # 启动线程
-        threading.Thread(target=self.run_process, args=(stock_list, days_count, show_boards, strict_mode), daemon=True).start()
+        threading.Thread(target=self.run_process, args=(stock_list, days_count, show_boards, strict_mode, monitoring_mode), daemon=True).start()
 
-    def run_process(self, stock_list, days_count=3, show_boards=True, strict_mode=False):
+    def run_process(self, stock_list, days_count=3, show_boards=True, strict_mode=False, monitoring_mode=False):
         summary_list_10 = []
         summary_list_30 = []
+        summary_list_3 = []
         summary_list_combined = [] # 综合最严异动列表
+
+        if monitoring_mode:
+            days_count = 1
+            self.log(f"模式: 监管期模式 (3天20%偏离，仅预测T+1，强制严格模式)")
 
         target_date_str = datetime.now().strftime("%Y%m%d")
         self.log(f"分析日期: {target_date_str}")
         self.log(f"预测天数: {days_count} 天")
         if strict_mode:
             self.log(f"模式: 严格模式 (基准 = 区间最低价)")
-        else:
+        elif not monitoring_mode:
             self.log(f"模式: 标准模式 (基准 = T-N日收盘价)")
             
         self.log(f"共 {len(stock_list)} 支股票待处理...")
@@ -758,14 +774,17 @@ class AnalysisApp:
 
             try:
                 self.log(f"正在处理: {code} {name} ...")
-                s10, s30 = self.process_one_stock(code, name, target_date_str, days_count, strict_mode)
+                s10, s30, s3 = self.process_one_stock(code, name, target_date_str, days_count, strict_mode, monitoring_mode)
                 
                 # 收集分表数据
                 if s10: summary_list_10.append(s10)
                 if s30: summary_list_30.append(s30)
+                if s3: summary_list_3.append(s3)
 
-                # 计算综合极小值 (取T+1空间较小者)
-                if s10 and s30:
+                # 计算综合极小值
+                if s3:
+                    summary_list_combined.append(s3)
+                elif s10 and s30:
                     v10 = parse_space(s10.get('T1_空间'))
                     v30 = parse_space(s30.get('T1_空间'))
                     if v10 <= v30:
@@ -785,24 +804,37 @@ class AnalysisApp:
                 if "timed out" in err_msg.lower():
                      err_msg = "网络请求超时"
                 self.log(f"❌ 处理出错: {err_msg}")
-
         if not self.stop_requested:
             self.log("\n" + "="*40)
             self.log("分析完成。生成汇总表...")
             
-            # 1. 显示 10日异动汇总
-            if summary_list_10:
-                self.print_summary_table("10日严重异动(100%偏离)", summary_list_10, show_boards=show_boards)
-            
-            # 2. 显示 30日异动汇总
-            if summary_list_30:
-                self.print_summary_table("30日严重异动(200%偏离)", summary_list_30, show_boards=show_boards)
-
-            # 3. 显示 综合最严异动汇总 (仅显示这一张)
-            if summary_list_combined:
-                self.print_summary_table("异动分析总览(取T1空间极小值)", summary_list_combined, show_boards=show_boards)
+            if monitoring_mode:
+                # 监管模式：仅显示综合总览 (T+1)
+                if summary_list_combined:
+                    final_view_data = []
+                    for item in summary_list_combined:
+                        new_item = item.copy()
+                        if "_meta_dates" in new_item and len(new_item["_meta_dates"]) > 0:
+                            new_item["_meta_dates"] = [new_item["_meta_dates"][0]]
+                        final_view_data.append(new_item)
+                    self.print_summary_table(f"监管期异动总览(3日20%)", final_view_data, show_boards=show_boards)
+                else:
+                    self.log("未生成监管期异动数据。")
             else:
-                self.log("未生成任何有效异动数据。")
+                # 普通模式：恢复原样 (显示10日、30日及综合表)
+                # 1. 显示 10日异动汇总
+                if summary_list_10:
+                    self.print_summary_table("10日严重异动(100%偏离)", summary_list_10, show_boards=show_boards)
+                
+                # 2. 显示 30日异动汇总
+                if summary_list_30:
+                    self.print_summary_table("30日严重异动(200%偏离)", summary_list_30, show_boards=show_boards)
+
+                # 3. 显示 综合最严异动汇总
+                if summary_list_combined:
+                    self.print_summary_table(f"异动分析总览 - 核心风控(取T1极小值)", summary_list_combined, show_boards=show_boards)
+                elif not summary_list_10 and not summary_list_30:
+                    self.log("未生成任何有效异动数据。")
 
             messagebox.showinfo("完成", "分析已完成！")
         else:
@@ -853,22 +885,65 @@ class AnalysisApp:
         
         self.log(f"\n【{title} 汇总表】")
         self.log(table_str)
-        
+
         # 如果需要保存图片
         if self.save_img_var.get():
              try:
-                 plot_summary_overview(summary_data, title.split(' ')[0], show_boards=show_boards)
+                 # 提取文件名前缀 (取空格前部分，防止过长)
+                 prefix = title.split(' ')[0]
+                 plot_summary_overview(summary_data, prefix, show_boards=show_boards)
              except Exception as e:
                  import traceback
                  self.log(f"绘图失败: {e}")
                  traceback.print_exc()
 
-    def process_one_stock(self, stock_code, name, target_date_str, days_count=3, strict_mode=False):
+    def get_stock_data_safe(self, code, start_date, end_date):
+        import random
+        max_retries = 3
+        for i in range(max_retries):
+            try:
+                # 1. 优先尝试东财
+                df = ak.stock_zh_a_hist(symbol=code, start_date=start_date, end_date=end_date, adjust="")
+                if df is not None and not df.empty:
+                    return df
+            except Exception as e:
+                # 备用源: 腾讯
+                if i == max_retries - 1:
+                    try:
+                        prefix = "sh" if code.startswith("6") else "sz" if code.startswith(("0", "3")) else "bj"
+                        tx_code = f"{prefix}{code}"
+                        df = ak.stock_zh_a_hist_tx(symbol=tx_code, start_date=start_date, end_date=end_date, adjust="qfq")
+                        if df is not None and not df.empty:
+                            df = df.rename(columns={'date': '日期', 'close': '收盘'})
+                            if 'pct_chg' in df.columns:
+                                df = df.rename(columns={'pct_chg': '涨跌幅'})
+                            else:
+                                df['涨跌幅'] = df['收盘'].pct_change() * 100
+                                df['涨跌幅'] = df['涨跌幅'].fillna(0.0)
+                            if '日期' in df.columns and '收盘' in df.columns:
+                                return df
+                    except: pass
+                time.sleep(random.uniform(1.0, 3.0))
+        return None
+
+    def get_index_data_safe(self, index_code):
+        import random
+        if index_code in self.index_cache: return self.index_cache[index_code]
+        for i in range(3):
+            try:
+                df = ak.stock_zh_index_daily(symbol=index_code)
+                if df is not None and not df.empty:
+                    self.index_cache[index_code] = df
+                    return df
+            except: time.sleep(random.uniform(1.0, 3.0))
+        return None
+
+    def process_one_stock(self, stock_code, name, target_date_str, days_count=3, strict_mode=False, monitoring_mode=False):
         index_code, index_name, limit_ratio = get_market_rules(stock_code)
         start_date = (pd.to_datetime(target_date_str) - timedelta(days=120)).strftime("%Y%m%d")
         
-        # 1. 获取个股
-        stock_df = ak.stock_zh_a_hist(symbol=stock_code, start_date=start_date, end_date=target_date_str, adjust="")
+        # 1. 获取个股 (带重试和备用源)
+        stock_df = self.get_stock_data_safe(stock_code, start_date, target_date_str)
         
         # 补全实时数据
         need_realtime = False
@@ -907,15 +982,18 @@ class AnalysisApp:
         stock_df = stock_df.rename(columns={'日期': 'date', '收盘': 'close', '涨跌幅': 'pct_chg'})
         stock_df['date'] = pd.to_datetime(stock_df['date']).dt.strftime('%Y%m%d')
 
-        # 2. 获取指数
-        index_df = ak.stock_zh_index_daily(symbol=index_code)
+        # 2. 获取指数 (带缓存和重试)
+        index_df = self.get_index_data_safe(index_code)
         if index_df is None or index_df.empty:
-            return None, None
+            return None, None, None
             
         index_df['date'] = pd.to_datetime(index_df['date']).dt.strftime('%Y%m%d')
+        
+        # 修复：补充缺失的指数数据处理逻辑
         index_df = index_df.sort_values('date')
-        index_df['index_pct_chg'] = index_df['close'].pct_change() * 100 
-        index_df = index_df.rename(columns={'close': 'index_close'})[['date', 'index_close', 'index_pct_chg']]
+        if 'close' in index_df.columns:
+            index_df['index_pct_chg'] = index_df['close'].pct_change() * 100 
+            index_df = index_df.rename(columns={'close': 'index_close'})[['date', 'index_close', 'index_pct_chg']]
         
         merged = pd.merge(stock_df, index_df, on='date', how='left')
         if merged['index_close'].isnull().any():
@@ -927,17 +1005,19 @@ class AnalysisApp:
         
         if len(merged) < 30:
             self.log("   [警告] 数据不足30天")
-            return None, None
+            return None, None, None
 
         last_date_str = merged.iloc[-1]['date']
         current_price = merged.iloc[-1]['close']
         future_dates = get_future_trading_dates(last_date_str, days_count)
 
-        df_10 = analyze_period_combined(merged, future_dates, 10, 100.0, limit_ratio, strict_mode)
-        df_30 = analyze_period_combined(merged, future_dates, 30, 200.0, limit_ratio, strict_mode)
+        df_10 = pd.DataFrame()
+        df_30 = pd.DataFrame()
+        df_3 = pd.DataFrame()
 
         def extract_summary(res_df, type_name):
             # 将所有预测行整理到字典 map
+            if res_df.empty: return None
             row_map = {}
             for idx, row in res_df.iterrows():
                 # T日（今天）
@@ -990,13 +1070,28 @@ class AnalysisApp:
             summary_dict["_meta_dates"] = meta_dates_list
             return summary_dict
 
-        if self.save_img_var.get():
-             safe_name = name.replace('*', '').replace(':', '')
-             title_base = f"{safe_name}({stock_code})异动分析({last_date_str})"
-             plot_result_table(df_10, f"{title_base}-10日(100%)")
-             plot_result_table(df_30, f"{title_base}-30日(200%)")
+        if monitoring_mode:
+            # 监管期模式：3天20%，强制严格模式
+            df_3 = analyze_period_combined(merged, future_dates, 3, 20.0, limit_ratio, True)
+            if self.save_img_var.get():
+                safe_name = name.replace('*', '').replace(':', '')
+                title_base = f"{safe_name}({stock_code})监管分析({last_date_str})"
+                plot_result_table(df_3, f"{title_base}-3日(20%)")
+            
+            return None, None, extract_summary(df_3, "3日(监管)")
+            
+        else:
+            # 标准模式
+            df_10 = analyze_period_combined(merged, future_dates, 10, 100.0, limit_ratio, strict_mode)
+            df_30 = analyze_period_combined(merged, future_dates, 30, 200.0, limit_ratio, strict_mode)
 
-        return extract_summary(df_10, "10日"), extract_summary(df_30, "30日")
+            if self.save_img_var.get():
+                 safe_name = name.replace('*', '').replace(':', '')
+                 title_base = f"{safe_name}({stock_code})异动分析({last_date_str})"
+                 plot_result_table(df_10, f"{title_base}-10日(100%)")
+                 plot_result_table(df_30, f"{title_base}-30日(200%)")
+
+            return extract_summary(df_10, "10日"), extract_summary(df_30, "30日"), None
 
 if __name__ == "__main__":
     if hasattr(sys, '_MEIPASS'):
